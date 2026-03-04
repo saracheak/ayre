@@ -275,7 +275,6 @@ import { MusicManager } from "./MusicManager.js";
 import * as Tone from "https://esm.sh/tone";
 import * as drumManager from "./DrumManager.js";
 import { WaveformVisualizer } from "./WaveformVisualizer.js";
-// ── NEW: VoiceManager ──────────────────────────────────────────────────────
 import { VoiceManager } from "./VoiceManager.js";
 
 export var Game = /*#__PURE__*/ (function () {
@@ -292,6 +291,8 @@ export var Game = /*#__PURE__*/ (function () {
 		this.lastVideoTime = -1;
 		this.hands = [];
 		this.handLineMaterial = null;
+		// FIX: promoted from inline per-frame allocation to a single shared instance
+		this.thumbIndexLineMaterial = null;
 		this.fingertipMaterialHand1 = null;
 		this.fingertipMaterialHand2 = null;
 		this.fingertipLandmarkIndices = [0, 4, 8, 12, 16, 20];
@@ -340,13 +341,9 @@ export var Game = /*#__PURE__*/ (function () {
 			new THREE.Color("#A259FF"),
 		];
 
-		// --- Mode --- 'default' | 'onehand' | 'voice'
 		this.currentMode = "default";
-
-		// ── VoiceManager instance (created lazily on first voice mode switch) ──
 		this.voiceManager = null;
 
-		// --- Microphone ---
 		this.isMicOn = false;
 		this.micStream = null;
 		this.micAnalyser = null;
@@ -488,9 +485,16 @@ export var Game = /*#__PURE__*/ (function () {
 						isFist: false,
 					});
 				}
+				// Shared materials — instantiated once, reused every frame
 				this.handLineMaterial = new THREE.LineBasicMaterial({
 					color: 0x00ccff,
 					linewidth: 8,
+				});
+				// FIX (issue #3): was previously created inline per frame inside
+				// _updateHandLines, leaking a new GPU material object every animation tick.
+				this.thumbIndexLineMaterial = new THREE.LineBasicMaterial({
+					color: 0xffffff,
+					linewidth: 3,
 				});
 				this.fingertipMaterialHand1 = new THREE.MeshBasicMaterial({
 					color: 0xffffff,
@@ -676,7 +680,6 @@ export var Game = /*#__PURE__*/ (function () {
 				)
 					return;
 
-				// In voice-only mode, skip hand tracking entirely
 				if (this.currentMode === "voice") return;
 
 				var videoTime = this.videoElement.currentTime;
@@ -1265,15 +1268,30 @@ export var Game = /*#__PURE__*/ (function () {
 				var _this = this;
 				var hand = this.hands[handIndex];
 				var lineGroup = hand.lineGroup;
+
+				// FIX (issue #3): skip dispose() on shared materials so they aren't
+				// invalidated the first time a child using them is removed. only dispose
+				// materials that were created locally (i.e. sprites and per-frame meshes).
+				var sharedMaterials = new Set([
+					this.handLineMaterial,
+					this.thumbIndexLineMaterial,
+					this.fingertipMaterialHand1,
+					this.fingertipMaterialHand2,
+				]);
+
 				while (lineGroup.children.length) {
 					var child = lineGroup.children[0];
 					lineGroup.remove(child);
 					if (child.geometry) child.geometry.dispose();
-					if (child.material) {
+					if (
+						child.material &&
+						!sharedMaterials.has(child.material)
+					) {
 						if (child.material.map) child.material.map.dispose();
 						child.material.dispose();
 					}
 				}
+
 				if (!landmarks || landmarks.length === 0 || !videoParams) {
 					lineGroup.visible = false;
 					return;
@@ -1341,13 +1359,12 @@ export var Game = /*#__PURE__*/ (function () {
 						var lineGeom = new THREE.BufferGeometry().setFromPoints(
 							[thumbPos, indexPos],
 						);
+						// FIX (issue #3): reuse the shared thumbIndexLineMaterial instead
+						// of allocating a new LineBasicMaterial every animation frame.
 						lineGroup.add(
 							new THREE.Line(
 								lineGeom,
-								new THREE.LineBasicMaterial({
-									color: 0xffffff,
-									linewidth: 3,
-								}),
+								this.thumbIndexLineMaterial,
 							),
 						);
 
@@ -1569,7 +1586,6 @@ export var Game = /*#__PURE__*/ (function () {
 					}
 				});
 
-				// ── Mic toggle ──────────────────────────────────────────────
 				const micBtn = document.getElementById("mic-toggle");
 				const micStatus = document.getElementById("mic-status");
 				let isMicActive = false;
@@ -1595,7 +1611,6 @@ export var Game = /*#__PURE__*/ (function () {
 					};
 				}
 
-				// ── AI Synth ────────────────────────────────────────────────
 				var aiBtn = document.getElementById("ai-generate-btn");
 				var aiInput = document.getElementById("ai-vibe-input");
 				if (aiBtn && aiInput) {
@@ -1642,16 +1657,11 @@ export var Game = /*#__PURE__*/ (function () {
 					});
 				}
 
-				// ── Recording ───────────────────────────────────────────────
 				var recordBtn = document.getElementById("record-btn");
 				var isRecording = false;
 				if (recordBtn) {
 					recordBtn.addEventListener("click", function () {
 						if (!isRecording) {
-							// If in voice mode, mic is already open — recording captures it.
-							// If NOT in voice mode but user wants mic in recording, they should
-							// use the mic toggle button first. Either way, no extra action needed:
-							// MusicManager routes mic → Tone.getDestination() → Recorder.
 							_this.musicManager.startRecording();
 							recordBtn.innerText = "■ STOP & DOWNLOAD";
 							recordBtn.style.background = "#ffffff";
@@ -1671,17 +1681,14 @@ export var Game = /*#__PURE__*/ (function () {
 			},
 		},
 		{
-			// ── Mode switching ───────────────────────────────────────────────
 			key: "setMode",
 			value: async function setMode(mode) {
 				var prevMode = this.currentMode;
 				this.currentMode = mode;
 				console.log("Mode switched to:", mode);
 
-				// ── Leaving voice mode ──
 				if (prevMode === "voice" && mode !== "voice") {
 					if (this.voiceManager) this.voiceManager.stop();
-					// Close mic (unless user explicitly toggled it on themselves)
 					this.musicManager.toggleMic(false);
 					const micBtn = document.getElementById("mic-toggle");
 					const micStatus = document.getElementById("mic-status");
@@ -1692,13 +1699,11 @@ export var Game = /*#__PURE__*/ (function () {
 					}
 					if (micStatus) micStatus.innerText = "MIC: OFF";
 
-					// Show the voice panel back to normal
 					const voicePanel =
 						document.getElementById("voice-mode-panel");
 					if (voicePanel) voicePanel.style.display = "none";
 				}
 
-				// ── Entering one-hand mode ──
 				if (mode === "onehand") {
 					const hand1 = this.hands[1];
 					if (hand1) {
@@ -1709,18 +1714,14 @@ export var Game = /*#__PURE__*/ (function () {
 					}
 				}
 
-				// ── Leaving one-hand → default ──
 				if (prevMode === "onehand" && mode === "default") {
 					drumManager.updateActiveDrums({});
 				}
 
-				// ── Entering voice mode ──
 				if (mode === "voice") {
-					// Ensure audio context is started
 					if (!this.musicManager.isStarted)
 						await this.musicManager.start();
 
-					// Auto-open mic so voice is captured in recordings
 					this.musicManager.toggleMic(true);
 					const micBtn = document.getElementById("mic-toggle");
 					const micStatus = document.getElementById("mic-status");
@@ -1731,24 +1732,20 @@ export var Game = /*#__PURE__*/ (function () {
 					}
 					if (micStatus) micStatus.innerText = "MIC: RECEIVING";
 
-					// Show voice panel
 					const voicePanel =
 						document.getElementById("voice-mode-panel");
 					if (voicePanel) voicePanel.style.display = "block";
 
-					// Create or restart VoiceManager
 					if (!this.voiceManager) {
 						this.voiceManager = new VoiceManager(
 							drumManager,
 							this.musicManager,
 							this,
-							// onStatusChange
 							(status) => {
 								const el =
 									document.getElementById("voice-status");
 								if (el) el.textContent = status;
 							},
-							// onCommandFired
 							(label) => {
 								const el = document.getElementById(
 									"voice-command-flash",
